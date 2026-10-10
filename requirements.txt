@@ -1,0 +1,8 @@
+requests>=2.31,<3
+loguru>=0.7,<1
+PyExecJS==1.5.1
+blackboxprotobuf==1.0.1
+pydantic>=2,<3
+typing_extensions>=4.7,<5
+websockets>=12,<14
+qrcode[pil]>=7.4,<9
