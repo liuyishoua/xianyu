@@ -31,6 +31,12 @@ class Store:
                     error TEXT, UNIQUE(uid,request_id));
             ''')
             db.execute("UPDATE jobs SET status='unknown',error='服务重启中断，请回查平台结果，不会自动重试' WHERE status IN ('pending','running')")
+            for row in db.execute("SELECT uid,id,data FROM documents WHERE kind='draft'").fetchall():
+                draft = json.loads(row['data'])
+                if draft.get('status') == 'publishing':
+                    draft['status'] = 'unknown'
+                    db.execute("UPDATE documents SET data=? WHERE uid=? AND kind='draft' AND id=?",
+                        (json.dumps(draft, ensure_ascii=False), row['uid'], row['id']))
         os.chmod(self.path, 0o600)
 
     @contextmanager
@@ -87,8 +93,8 @@ class Store:
 
 
 class Service:
-    def __init__(self, directory, platform):
-        self.store = Store(directory)
+    def __init__(self, directory, platform, store=None):
+        self.store = store or Store(directory)
         self.platform = platform
         self.lock = threading.RLock()
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix='xianyu-web')
@@ -156,7 +162,7 @@ class Service:
         self.record_snapshot(uid, product)
         return product
 
-    def job(self, kind, title, request_id, work):
+    def job(self, kind, title, request_id, work, execution_guard=None):
         uid = self.uid()
         if not isinstance(request_id, str) or not 8 <= len(request_id) <= 100:
             raise ValueError('操作标识无效，请刷新页面后再试')
@@ -175,12 +181,19 @@ class Service:
                     db.execute("UPDATE jobs SET status='running',updated=? WHERE id=?", (time.time(), job_id))
                 try:
                     if self.uid() != uid: raise PlatformError('账号已切换，请重新发起操作')
+                    if execution_guard: execution_guard()
                     result = work(uid)
                 except (PlatformError, ValueError, LookupError) as exc:
                     status = 'failed'
                     error = str(exc) if isinstance(exc, (PlatformError, ValueError)) else '记录不存在'
+                    if isinstance(exc,PlatformError) and kind in ('send','sync','history','comment','publish'):
+                        state='expired' if 'SESSION_EXPIRED' in str(exc) or 'SESSION_EXOIRED' in str(exc) else 'risk' if 'USER_VALIDATE' in str(exc) or 'RGV587_ERROR' in str(exc) else None
+                        if state:
+                            from .account_maintenance import Bridge
+                            component='listener.comment' if kind=='comment' else 'publisher' if kind=='publish' else 'listener.dm'
+                            Bridge(self.store.directory).notify(uid,uid,state,request_id,component)
                 except Exception:
-                    status = 'unknown' if kind in ('send', 'publish', 'create') else 'failed'
+                    status = 'unknown' if kind in ('send', 'publish', 'create', 'comment') else 'failed'
                     error = ('请求中断，结果待核查，请同步平台记录；不会自动重试' if status == 'unknown'
                              else '操作未完成，请检查账号或网络后再试')
                 with self.store.connect() as db:
@@ -211,6 +224,9 @@ class Service:
         try: conv = self.store.get(uid, 'conversation', cid)
         except LookupError: conv = {'id': cid, 'note': ''}
         if page.get('peer_id'): conv['peer_id'] = page['peer_id']
+        if page.get('item_id') and not conv.get('item_id'): conv['item_id'] = page['item_id']
+        if page.get('name') and (not conv.get('name') or conv['name'].startswith('用户 ')):
+            conv['name'] = page['name']
         conv.setdefault('name', '用户 ' + str(conv.get('peer_id', cid))[-4:])
         conv['updated_at'] = time.time()
         existing_messages = [m for m in self.store.list(uid, 'message') if m['cid'] == cid]
@@ -237,14 +253,14 @@ class Service:
         self.store.put(uid, 'conversation', conv)
         return {'count': len(page['messages']), 'has_more': page.get('has_more', False), 'cursor': page.get('cursor')}
 
-    def sync(self, request_id):
+    def sync(self, request_id, execution_guard=None):
         def work(uid):
             result = self.platform.socket('sync')
             for conv in result['conversations']: self.save_history(uid, conv['id'], conv)
             return {'count': len(result['conversations']), 'scope': result['scope']}
-        return self.job('sync', '同步最近会话', request_id, work)
+        return self.job('sync', '同步最近会话', request_id, work, execution_guard)
 
-    def history(self, cid, older, request_id):
+    def history(self, cid, older, request_id, execution_guard=None):
         uid = self.uid()
         conv = self.store.get(uid, 'conversation', cid)
         cursor = conv.get('cursor') if older else None
@@ -254,9 +270,9 @@ class Service:
             if older and page.get('cursor') == cursor and page.get('has_more'):
                 raise PlatformError('历史游标没有前进，已停止重复读取')
             return self.save_history(uid, cid, page)
-        return self.job('history', '读取聊天历史', request_id, work)
+        return self.job('history', '读取聊天历史', request_id, work, execution_guard)
 
-    def send(self, cid, data):
+    def send(self, cid, data, execution_guard=None):
         uid = self.uid()
         if data.get('expected_account_id') is not None and str(data['expected_account_id']) != str(uid):
             raise ValueError('执行账号与当前连接账号不一致，尚未发送')
@@ -275,6 +291,7 @@ class Service:
             if media:
                 uploaded = self.platform.upload(str(self.media_dir / media['filename']))
                 image = {'url': uploaded['url'], 'width': uploaded['width'], 'height': uploaded['height']}
+            if execution_guard: execution_guard()
             result = self.platform.socket('send', cid=cid, peer_id=conv['peer_id'], text=text, image=image)
             self.store.put(uid, 'message', {'cid': cid, 'sender_id': uid, 'outgoing': True,
                 'kind': 'image' if media else 'text', 'text': text, 'images': [image['url']] if image else [],
@@ -283,7 +300,7 @@ class Service:
             conv['updated_at'] = time.time()
             self.store.put(uid, 'conversation', conv)
             return result
-        return self.job('send', '发送图片' if media else '发送文字消息', data.get('request_id'), work)
+        return self.job('send', '发送图片' if media else '发送文字消息', data.get('request_id'), work, execution_guard)
 
     def media(self, file):
         uid = self.uid()
@@ -303,7 +320,7 @@ class Service:
             os.chmod(self.media_dir / filename, 0o600)
         except (UnidentifiedImageError, OSError): raise ValueError('无法读取这张图片')
         return self.store.put(uid, 'media', {'id': media_id, 'filename': filename,
-             'width': image.width, 'height': image.height, 'url': '/api/media/' + media_id})
+             'width': image.width, 'height': image.height, 'url': '/api/media/' + media_id + '?account_id=' + uid})
 
     def draft(self, data, draft_id=None):
         uid = self.uid()
@@ -313,7 +330,7 @@ class Service:
         if delivery not in ('包邮', '按距离计费', '一口价', '无需邮寄'): raise ValueError('配送方式无效')
         if draft_id:
             old = self.store.get(uid, 'draft', draft_id)
-            if old.get('status') in ('publishing', 'published'): raise ValueError('此草稿已发布或正在发布，请复制新草稿')
+            if old.get('status') in ('publishing', 'published', 'unknown'): raise ValueError('此草稿已提交或结果待核查，不能重复修改发布')
         ids = data.get('media_ids', [])
         if not isinstance(ids, list) or len(ids) > 9: raise ValueError('最多选择 9 张图片')
         for media_id in ids: self.store.get(uid, 'media', media_id)
@@ -321,7 +338,7 @@ class Service:
         value.update(description=text, delivery=delivery, media_ids=ids, status='draft', updated_at=time.time())
         return self.store.put(uid, 'draft', value, draft_id)
 
-    def publish(self, draft_id, request_id):
+    def publish(self, draft_id, request_id, execution_guard=None):
         uid = self.uid()
         draft = self.store.get(uid, 'draft', draft_id)
         if draft['status'] != 'draft': raise ValueError('草稿已提交，不能重复发布')
@@ -332,16 +349,24 @@ class Service:
                 if not value.is_finite() or value < 0 or value > 9999999 or value.as_tuple().exponent < -2: raise ValueError()
             if Decimal(str(draft['price'])) <= 0: raise ValueError()
         except (InvalidOperation, ValueError): raise ValueError('请填写有效金额，售价须大于 0，最多两位小数')
-        locations = self.store.get(uid, 'settings', 'locations')['items']
+        try: locations = self.store.get(uid, 'settings', 'locations')['items']
+        except LookupError: locations = []
         index = draft.get('location_index')
-        if not isinstance(index, int) or not 0 <= index < len(locations): raise ValueError('请选择发货地点')
+        if index is None and draft['delivery']=='无需邮寄': location=None
+        elif isinstance(index,int) and not isinstance(index,bool) and 0<=index<len(locations): location=locations[index]
+        else: raise ValueError('请选择发货地点')
         files = [str(self.media_dir / self.store.get(uid, 'media', x)['filename']) for x in draft['media_ids']]
         def work(uid):
             current = self.store.get(uid, 'draft', draft_id)
             if current['status'] != 'draft': raise PlatformError('草稿已经提交')
             current['status'] = 'publishing'; self.store.put(uid, 'draft', current)
             try:
-                result = self.platform.publish(current, files, locations[index])
+                if execution_guard: execution_guard()
+                def progress(stage,started):
+                    current.update(publish_stage=stage,publish_request_started=started)
+                    self.store.put(uid,'draft',current)
+                kwargs={'progress':progress} if getattr(self.platform,'supports_publish_progress',False) else {}
+                result = self.platform.publish(current, files, location,**kwargs)
             except PlatformError:
                 current['status'] = 'draft'; self.store.put(uid, 'draft', current); raise
             except Exception:
@@ -351,4 +376,4 @@ class Service:
             try: self.save_product(uid, self.platform.item(result['item_id']))
             except Exception: result['readback_pending'] = True
             return result
-        return self.job('publish', '发布商品', request_id, work)
+        return self.job('publish', '发布商品', request_id, work, execution_guard)

@@ -1,3 +1,4 @@
 -r requirements.txt
 Flask>=3.1,<4
 waitress>=3,<4
+PySocks==1.7.1

@@ -3,6 +3,7 @@
     auto_https disable_redirects
 }
 https://d.58nft.net:9448 {
+    encode zstd gzip
     tls /var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/d.58nft.net/d.58nft.net.crt /var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/d.58nft.net/d.58nft.net.key
     reverse_proxy 127.0.0.1:8770 {
         header_up Host 127.0.0.1:8770

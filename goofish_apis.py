@@ -5,6 +5,7 @@ LastEditTime: 2026-04-26 14:33:00
 FilePath: \XianYuApis\goofish_apis.py
 '''
 import json
+import io
 import os
 import subprocess
 import time
@@ -13,6 +14,7 @@ from typing import Optional, List
 from urllib.parse import quote
 
 import requests
+from PIL import Image
 
 from message.types import Price, DeliverySettings
 from utils.goofish_utils import generate_sign, trans_cookies, generate_device_id
@@ -421,14 +423,13 @@ class XianyuApis:
             "appkey": "xy_chat",
             "_input_charset": "utf-8"
         }
-        with open(media_path, 'rb') as f:
-            media_name = os.path.basename(media_path)
-            files = {
-                "file": (media_name, f, "image/png")
-            }
-            response = self.session.post(self.upload_media_url, headers=headers, params=params, files=files)
-            res_json = response.json()
-            return res_json
+        # Encode an upload copy; retain the original owned workspace file.
+        with Image.open(media_path) as image:
+            encoded=io.BytesIO()
+            image.convert('RGB').save(encoded,format='JPEG',quality=85,optimize=True)
+        files={'file':(Path(media_path).stem+'.jpg',encoded.getvalue(),'image/jpeg')}
+        response=self.session.post(self.upload_media_url,headers=headers,params=params,files=files)
+        return response.json()
 
     def get_item_info(self, item_id):
         params = {
@@ -578,6 +579,11 @@ class XianyuApis:
         return res_json
 
     def public(self, images_path: List[str], goods_desc: str, price: Optional[Price], ds: DeliverySettings):
+        def mark_stage(stage,started=False):
+            self.publish_preparation_stage=stage
+            self.publish_request_started=started
+            if getattr(self,'publish_progress',None): self.publish_progress(stage,started)
+        mark_stage('media_upload')
         headers = {
             "accept": "application/json",
             "accept-language": "en,zh-CN;q=0.9,zh;q=0.8,zh-TW;q=0.7,ja;q=0.6",
@@ -693,6 +699,7 @@ class XianyuApis:
                 data["itemPriceDTO"]["origPriceInCent"] = str(int(price["original_price"] * 100))
         else:
             data["defaultPrice"] = True
+        mark_stage('category')
         channel_res = self.get_public_channel(goods_desc, images_info)
         for card in channel_res["data"]["cardList"]:
             card_data = card["cardData"]
@@ -726,16 +733,20 @@ class XianyuApis:
             "tbCatId": str(channel_res["data"]["categoryPredictResult"]["tbCatId"])
         }
 
-        location_res = self.get_default_location()["data"]["commonAddresses"][0]
-        data["itemAddrDTO"] = {
-            "area": location_res["area"],
-            "city": location_res["city"],
-            "divisionId": location_res["divisionId"],
-            "gps": f"{location_res['longitude']},{location_res['latitude']}",
-            "poiId": location_res["poiId"],
-            "poiName": location_res["poi"],
-            "prov": location_res["prov"]
-        }
+        locations = self.get_default_location()["data"].get("commonAddresses", [])
+        if not locations and ds['choice'] != '无需邮寄':
+            raise ValueError('发布实物商品需要已确认的发货地点')
+        if locations:
+            location_res = locations[0]
+            data["itemAddrDTO"] = {
+                "area": location_res["area"],
+                "city": location_res["city"],
+                "divisionId": location_res["divisionId"],
+                "gps": f"{location_res['latitude']},{location_res['longitude']}",
+                "poiId": location_res["poiId"],
+                "poiName": location_res["poi"],
+                "prov": location_res["prov"]
+            }
 
         data_val = json.dumps(data, separators=(',', ':'))
         data = {
@@ -744,6 +755,7 @@ class XianyuApis:
         token = self.session.cookies.get('_m_h5_tk', '').split('_')[0]
         sign = generate_sign(params['t'], token, data_val)
         params['sign'] = sign
+        mark_stage('final_publish',True)
         response = self.session.post(url, headers=headers, params=params, data=data)
         res_json = response.json()
         return res_json

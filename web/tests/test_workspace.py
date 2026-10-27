@@ -64,11 +64,37 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(first.json['id'],second.json['id']);self.assertEqual(self.wait(first)['status'],'completed')
         self.assertEqual(self.platform.publishes,1)
         self.assertEqual(self.post(path,{'request_id':self.rid()}).status_code,400)
+    def test_non_shipping_service_does_not_invent_location(self):
+        d=self.draft(delivery='无需邮寄',location_index=None)
+        self.app.extensions['workspace'].store.put('demo-seller','settings',{'items':[]},'locations')
+        job=self.wait(self.post('/drafts/'+d['id']+'/publish',{'request_id':self.rid()}))
+        self.assertEqual(job['status'],'completed')
+        self.assertEqual(self.platform.publishes,1)
+
+    def test_persisted_stage_distinguishes_prepare_and_final(self):
+        self.platform.supports_publish_progress=True
+        for started in (False,True):
+            def fail(*args,progress):
+                progress('final_publish' if started else 'media_upload',started)
+                if started:raise TimeoutError()
+                from web.platform import PlatformError
+                raise PlatformError('准备失败，未调用最终发布')
+            self.platform.publish=fail
+            d=self.draft()
+            job=self.wait(self.post('/drafts/'+d['id']+'/publish',{'request_id':self.rid()}))
+            saved=self.app.extensions['workspace'].store.get('demo-seller','draft',d['id'])
+            self.assertEqual(saved['publish_request_started'],started)
+            self.assertEqual(job['status'],'unknown' if started else 'failed')
+            self.assertEqual(saved['status'],'unknown' if started else 'draft')
+
     def test_publish_timeout_is_not_retried(self):
         self.platform.fail_publish=True;d=self.draft()
         first=self.post('/drafts/'+d['id']+'/publish',{'request_id':self.rid()});job=self.wait(first)
         self.assertEqual(job['status'],'unknown');self.assertEqual(self.platform.publishes,1)
         self.assertEqual(self.s.store.get(self.s.uid(),'draft',d['id'])['status'],'unknown')
+        response = self.client.put('/api/drafts/'+d['id'], json=d, headers=self.headers)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.post('/drafts/'+d['id']+'/publish', {'request_id':self.rid()}).status_code, 400)
     def test_invalid_money_prevents_publication(self):
         for price in ['NaN','Infinity','-1','0','1.001']:
             d=self.draft(price=price);r=self.post('/drafts/'+d['id']+'/publish',{'request_id':self.rid()})

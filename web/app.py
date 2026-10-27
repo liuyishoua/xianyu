@@ -17,10 +17,12 @@ from .service import Service
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def create_app(directory=None, platform=None, auth=True, public_origin=None):
+def create_app(directory=None, platform=None, auth=True, public_origin=None, workspace=None, accounts=None, monitor=None):
     directory = Path(directory or ROOT / '.local' / 'web')
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     app = Flask(__name__, static_folder='static')
+    from .page_assets import install_pages
+    install_pages(app, {'index.html','login.html','automation.html'}, bundles={'app.js':'app.bundle.mjs'})
     key = directory / 'session-key'
     if not key.exists():
         fd = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -34,14 +36,26 @@ def create_app(directory=None, platform=None, auth=True, public_origin=None):
         SESSION_COOKIE_NAME='xianyu_console', SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax',
         SESSION_COOKIE_SECURE=bool(public_origin and public_origin.startswith('https:')),
         PERMANENT_SESSION_LIFETIME=3600 * 12)
-    service = Service(directory, platform or Platform(ROOT / '.local' / 'session.json'))
+    service = workspace or Service(directory, platform or Platform(ROOT / '.local' / 'session.json'))
+    from .accounts import Accounts
+    from .monitoring import Monitoring
+    accounts = accounts or Accounts(service)
+    monitor = monitor or Monitoring(accounts, directory / 'channel.json')
     app.extensions['workspace'] = service
+    app.extensions['accounts'] = accounts
+    app.extensions['monitor'] = monitor
+    children = {}
     from .channel_bridge import register_channel
     register_channel(app, service, directory/'channel.json')
+    from .business import register as register_business
+    register_business(app, accounts, monitor)
+    from .account_maintenance import register as register_maintenance
+    register_maintenance(app, accounts, directory, monitor)
     attempts = {}
 
     @app.before_request
     def guard():
+        if request.path.startswith('/maintenance/'): return
         if request.method not in ('GET', 'HEAD', 'OPTIONS'):
             origin = request.headers.get('Origin')
             expected = public_origin or request.host_url.rstrip('/')
@@ -54,8 +68,20 @@ def create_app(directory=None, platform=None, auth=True, public_origin=None):
         if auth and not session.get('authenticated'):
             if request.path.startswith('/api/'): return jsonify(error='请先登录工作台'), 401
             return redirect('/login')
+        selected = request.headers.get('X-Account-ID') if request.path.startswith('/api/') else None
+        if request.path.startswith(('/api/media/', '/api/account/qr/')):
+            selected = selected or request.args.get('account_id')
+        if not request.path.startswith('/api/business/') and selected and selected != str((service.platform.identity() or {}).get('id', '')):
+            try: target = accounts.resolve(selected)
+            except LookupError: return jsonify(error='所选账号不存在，请重新选择账号'), 404
+            with accounts.lock:
+                if selected not in children:
+                    children[selected] = create_app(directory, auth=auth, public_origin=public_origin,
+                        workspace=target, accounts=accounts, monitor=monitor)
+                child = children[selected]
+            with child.request_context(request.environ): return child.full_dispatch_request()
         expected_account = request.headers.get('X-Execution-Account')
-        if expected_account and request.path.startswith('/api/'):
+        if expected_account and request.path.startswith('/api/') and not request.path.startswith('/api/business/'):
             service.lock.acquire()
             g.execution_account_lock = True
             identity = service.platform.identity()
@@ -68,9 +94,9 @@ def create_app(directory=None, platform=None, auth=True, public_origin=None):
                 # Return an existing operation before any operation-specific preflight.
                 rid = data.get('request_id')
                 identity = service.platform.identity()
-                if data.get('expected_account_id') is not None and (not identity or str(data['expected_account_id']) != str(identity['id'])):
+                if not request.path.startswith('/api/business/') and data.get('expected_account_id') is not None and (not identity or str(data['expected_account_id']) != str(identity['id'])):
                     return jsonify(error='执行账号与当前连接账号不一致，尚未发送'), 409
-                if rid and identity:
+                if rid and identity and not request.path.startswith('/api/business/'):
                     with service.store.connect() as db:
                         row = db.execute('SELECT * FROM jobs WHERE uid=? AND request_id=?', (identity['id'], rid)).fetchone()
                     if row: return jsonify(service.store.job_projection(row)), 202
@@ -125,7 +151,125 @@ def create_app(directory=None, platform=None, auth=True, public_origin=None):
     @app.get('/api/meta')
     def meta():
         return {'demo': bool(getattr(service.platform, 'demo', False)), 'account': service.platform.identity(),
-                'now': time.time(), 'authenticated': bool(auth), 'version': '1.0'}
+                'accounts': accounts.list(), 'now': time.time(), 'authenticated': bool(auth), 'version': '2.0'}
+
+    @app.get('/api/accounts')
+    def account_matrix():
+        from .phone_login_native import active_requests
+        sms=active_requests(directory)
+        return {'items': [{**row, 'dm': monitor.config(accounts.resolve(row['id']), 'dm'),
+            'comment': monitor.config(accounts.resolve(row['id']), 'comment'),
+            'sms_request':sms.get(row['id'])} for row in accounts.list()]}
+
+    @app.patch('/api/accounts/<uid>')
+    def rename_account(uid):
+        target = accounts.resolve(uid)
+        name = str(request.json.get('name', '')).strip()
+        if not name or len(name) > 80: raise ValueError('账号备注应为 1 到 80 字')
+        return service.store.put(accounts.scope, 'account-label', {'name': name}, uid)
+
+    @app.post('/api/accounts/<uid>/browser-session')
+    def import_browser_account(uid):
+        from .session_import import import_browser_session
+        data=request.get_json(silent=True) or {}
+        return import_browser_session(accounts,monitor,directory,uid,data.get('cookie'))
+
+    def sms_browser(id):
+        from .phone_login_native import NativePhoneLogin
+        return NativePhoneLogin(directory)
+
+    @app.get('/api/account/sms/<id>')
+    def sms_browser_view(id):
+        return sms_browser(id).view(id)
+
+    @app.get('/api/account/sms/<id>/frame')
+    def sms_browser_frame(id):
+        return send_file(io.BytesIO(sms_browser(id).frame(id)),mimetype='image/jpeg')
+
+    @app.post('/api/account/sms/<id>/control')
+    def sms_browser_control(id):
+        return sms_browser(id).control(id,request.get_json())
+
+    @app.get('/api/models')
+    def models():
+        data = monitor.models(service)
+        try: bindings = monitor.model_bindings(service, data) if data.get('connected') else service.store.get(service.uid(), 'settings', 'model-bindings')
+        except (LookupError, PlatformError): bindings = {}
+        from .monitoring import agent_snapshot
+        return {**data, 'bindings': bindings, 'agent_bindings': {p: agent_snapshot(data, bindings.get(p, '')).get('id', '') for p in ('dm', 'comment', 'content')}}
+
+    @app.put('/api/models')
+    def save_models():
+        from .monitoring import PURPOSES, available, resolve_agent, agent_snapshot, bound_route
+        catalog = monitor.client(service).catalog()
+        bindings = {}
+        for purpose in PURPOSES:
+            route_id = str(request.json.get(purpose) or '')
+            if 'agent_bindings' in request.json:
+                try: previous = service.store.get(service.uid(), 'settings', 'model-bindings')
+                except LookupError: previous = {}
+                agent_data = request.json['agent_bindings']
+                if not isinstance(agent_data, dict): raise ValueError('Agent 配置格式无效')
+                route_id = resolve_agent(catalog, purpose, service.uid(), str(agent_data.get(purpose) or ''), previous.get(purpose, ''), client=monitor.client(service))
+            if route_id and not bound_route(catalog, purpose, service.uid(), route_id):
+                raise ValueError('请选择该用途可用的 Agent')
+            bindings[purpose] = route_id
+        bindings['agents'] = {p: agent_snapshot(catalog, bindings[p]) for p in PURPOSES}
+        bindings['explicit_empty'] = [p for p in PURPOSES if not bindings[p]]
+        return service.store.put(service.uid(), 'settings', bindings, 'model-bindings')
+
+    def validate_surface(surface):
+        if surface not in ('dm', 'comment'): raise LookupError()
+
+    @app.get('/api/monitoring/<surface>')
+    def monitor_view(surface):
+        validate_surface(surface)
+        return monitor.view(service, surface)
+
+    @app.put('/api/monitoring/<surface>')
+    def monitor_update(surface):
+        validate_surface(surface)
+        return monitor.update(service, surface, request.json)
+
+    @app.post('/api/monitoring/<surface>/poll')
+    def monitor_poll(surface):
+        validate_surface(surface)
+        if not monitor.config(service, surface)['enabled']: raise ValueError('请先开启监听')
+        if monitor.config(service, surface).get('blocked_auth'):
+            raise ValueError('请先完成账号登录或安全验证，再到账号矩阵检查连接')
+        monitor.pool.submit(monitor.tick, service, surface)
+        return {'ok': True}
+
+    @app.post('/api/monitoring/<surface>/demo-event')
+    def demo_monitor_event(surface):
+        validate_surface(surface)
+        if not getattr(service.platform, 'demo', False): raise ValueError('真实模式不能生成模拟消息')
+        if not monitor.config(service, surface)['enabled']: raise ValueError('请先开启监听')
+        message = {'id': uuid.uuid4().hex, 'sender_id': '800000', 'outgoing': False,
+            'kind': 'text', 'text': '你好，商品还在吗？支持同城自提吗？', 'images': [], 'timestamp': time.time()}
+        if surface == 'dm':
+            message['cid'] = '900000'
+            service.platform.incoming.append(message)
+        else:
+            message['item_id'] = '1000000001'
+            service.platform.comment_rows.append(message)
+        monitor.pool.submit(monitor.tick, service, surface)
+        return {'ok': True}
+
+    @app.post('/api/monitoring/<surface>/<item_id>/approve')
+    def monitor_approve(surface, item_id):
+        validate_surface(surface)
+        return jsonify(monitor.approve(service, surface, item_id)), 202
+
+    @app.post('/api/monitoring/<surface>/<item_id>/reanalyze')
+    def reanalyze_inbox(surface, item_id):
+        validate_surface(surface)
+        return monitor.reanalyze(service, surface, item_id)
+
+    @app.post('/api/monitoring/<surface>/<item_id>/dismiss')
+    def monitor_dismiss(surface, item_id):
+        validate_surface(surface)
+        return monitor.dismiss(service, surface, item_id)
 
     @app.get('/api/overview')
     def overview():
@@ -265,9 +409,23 @@ def create_app(directory=None, platform=None, auth=True, public_origin=None):
             except LookupError: pass
         return {'account': identity, 'check': checked, 'login': {k:v for k,v in service.login.items() if k!='image'}}
 
+    @app.get('/api/account/sms-executor-package')
+    def sms_executor_package():
+        package=directory/'sms-worker-package.tar.gz'
+        if not package.is_file():raise LookupError()
+        return send_file(package,mimetype='application/gzip',as_attachment=True,
+            download_name='leo-xianyu-sms.tar.gz')
+
     @app.post('/api/account/check')
     def check_account():
-        def work(uid): return service.store.put(uid, 'settings', service.platform.check(), 'account-check')
+        def work(uid):
+            try: result = service.platform.check()
+            except PlatformError as exc:
+                service.store.put(uid, 'settings', {'checked_at': time.time(), 'can_message': False,
+                    'error': str(exc)}, 'account-check')
+                raise
+            monitor.connection_restored(service)
+            return service.store.put(uid, 'settings', result, 'account-check')
         return jsonify(service.job('check', '检查账号连接', request.json.get('request_id'), work)), 202
 
     @app.get('/api/locations')
@@ -296,6 +454,8 @@ def create_app(directory=None, platform=None, auth=True, public_origin=None):
         if getattr(service.platform, 'demo', False): raise ValueError('演示空间不会发起真实扫码')
         from .platform import qrcode_login
         import qrcode
+        expected = request.json.get('reconnect_account_id')
+        if expected: accounts.resolve(str(expected))
         with service.login_lock:
             if service.login['status'] in ('starting', 'waiting', 'scanned', 'finishing'): return {k:v for k,v in service.login.items() if k!='image'}
             qr_id = uuid.uuid4().hex
@@ -310,13 +470,12 @@ def create_app(directory=None, platform=None, auth=True, public_origin=None):
                     service.login['status'] = {'NEW':'waiting', 'SCANNED':'scanned', 'SCANED':'scanned',
                                                'CONFIRMED':'finishing', 'EXPIRED':'expired'}.get(status, 'waiting')
             try:
-                # A switch never replaces the session while another platform operation is in flight.
-                with service.lock:
-                    api = qrcode_login(timeout=120, show_qrcode=False, on_qrcode=on_qr, on_status=on_status)
-                    if not api.session.cookies.get_dict().get('unb'): raise PlatformError('登录未返回账号身份')
-                    save_session(service.platform.session_path, api)
-                    service.bootstrap()
-                with service.login_lock: service.login['status'] = 'confirmed'
+                api = qrcode_login(timeout=120, show_qrcode=False, on_qrcode=on_qr, on_status=on_status)
+                uid = accounts.register(api, str(expected) if expected else None)
+                target = accounts.resolve(uid)
+                if target.store.get(uid, 'settings', 'account-check').get('can_message'):
+                    monitor.connection_restored(target)
+                with service.login_lock: service.login.update(status='confirmed', account_id=uid)
             except TimeoutError:
                 with service.login_lock: service.login['status'] = 'expired'
             except Exception:

@@ -23,6 +23,22 @@ def main():
     if args.demo:
         from .demo import seed
         seed(app.extensions['workspace'])
+        from .service import Service
+        accounts = app.extensions['accounts']
+        second = Service(directory, DemoPlatform('demo-studio', '慢慢生活 · 家居店'), store=accounts.store)
+        accounts.services['demo-studio'] = second
+        seed(second)
+    from .workspace_identity import install_identity
+    def tenant_app(path):
+        from .platform import Platform
+        child=create_app(path, platform=Platform(path/'bootstrap-session.json'), auth=False, public_origin=args.public_origin)
+        child.extensions['monitor'].start()
+        child.extensions['business'].start()
+        return child
+    if not args.demo:
+        install_identity(app, directory, 'xianyu', tenant_app, machine_prefixes=('/maintenance/',))
+    app.extensions['monitor'].start()
+    app.extensions['business'].start()
     from waitress import serve
     print(f'闲鱼工作台 http://{args.host}:{args.port}（{"演示" if args.demo else "真实"}模式）', flush=True)
     if not args.no_auth: print(f'工作台访问密码保存在 {directory}/admin-password', flush=True)

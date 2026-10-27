@@ -7,8 +7,12 @@ from .platform import Platform
 
 class DemoPlatform:
     demo = True
+    supports_comments = True
     session_path = Path('/nonexistent/xianyu-demo/session.json')
-    def identity(self): return {'id': 'demo-seller', 'name': '晴天的闲置小铺', 'status': 'connected'}
+    def __init__(self, uid='demo-seller', name='晴天的闲置小铺'):
+        self.uid, self.name = uid, name
+        self.incoming, self.comment_rows = [], []
+    def identity(self): return {'id': self.uid, 'name': self.name, 'status': 'connected'}
     def check(self): return {'checked_at': time.time(), 'can_message': True}
     def item(self, value):
         return sample_product(str(value) if str(value).isdigit() or str(value).startswith('demo-') else '1000000001', 0)
@@ -22,12 +26,19 @@ class DemoPlatform:
         return {'item_id': item_id, 'url':'#demo-publication'}
     def socket(self, operation, **kwargs):
         if operation == 'sync':
-            return {'conversations': [{'id': str(900000+i), **history(str(900000+i),i)} for i in range(3)],
+            conversations = [{'id': str(900000+i), **history(str(900000+i),i)} for i in range(3)]
+            for conv in conversations:
+                conv['messages'].extend(m for m in getattr(self, 'incoming', []) if m['cid'] == conv['id'])
+            return {'conversations': conversations,
                     'scope':'演示会话'}
         if operation == 'history': return history(kwargs['cid'],0)
         if operation == 'create': return {'id':'900003','peer_id':kwargs['peer_id']}
         if operation == 'send': return {'accepted':True,'message_id':'demo-'+uuid.uuid4().hex,'cid':kwargs['cid']}
         raise ValueError()
+
+    def comments(self, item_ids=()): return list(getattr(self, 'comment_rows', []))
+    def reply_comment(self, comment, text):
+        return {'accepted': True, 'message_id': 'demo-comment-' + uuid.uuid4().hex}
 
 
 def sample_product(item_id, index):

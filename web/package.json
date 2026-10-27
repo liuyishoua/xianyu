@@ -1,0 +1,1 @@
+{"name":"xianyu-workspace-assets","private":true,"type":"module","scripts":{"build":"esbuild static/app.js --bundle --format=esm --target=es2022 --minify --outfile=static/app.bundle.mjs"},"devDependencies":{"esbuild":"0.28.2"}}

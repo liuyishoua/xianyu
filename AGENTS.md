@@ -9,3 +9,5 @@
 - 修改后运行 `.venv/bin/python -m unittest discover -s web/tests -v`；前端变更运行 `node --check web/static/app.js` 并检查对应浏览器交互。
 - 部署只重启 `xianyu-web.service`；门户接入遵循门户技能，不修改无关应用配置。
 - Channel 可选账号连接器通过既有 HTTP 接口观察本地消息、同步最近会话和发送文字。`X-Execution-Account` 在请求期间持有账号锁，`expected_account_id` 在发送入队与执行前复核；不改变普通工作台操作。连接器默认关闭，测试仅使用 DemoPlatform，不向真实联系人发送。
+
+- 首屏使用 `web/static/app.bundle.mjs`。修改 `app.js`、`ui.js` 或 `workspace.js` 后，在 `web/` 运行 `npm ci && npm run build`，同步更新打包产物；不要手改产物。页面由 `page_assets.py` 内嵌本地资源并添加精确 CSP 哈希，不开放 `unsafe-inline`。
