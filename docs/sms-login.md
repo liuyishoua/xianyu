@@ -226,9 +226,9 @@ entry=home、headless=false，原配置备份在同目录 phone-login-config.bef
 只重启 xianyu-web.service，服务 active。
 
 通过原账号维护队列为“留一手”做了一次真实官方浏览器发码，任务：
-02be0ee9-7cf6-43f4-9494-83bb2ae69d0a。
+02be0ee9-7cf6-43f4-20050-83bb2ae69d0a。
 结果 queued → preparing → uncertain，原因是官方安全验证；尚未取得 smsToken。
-原页面会话继续保留，不重复点击发码。已请主人在 https://d.58nft.net:9448/ 的账号矩阵中
+原页面会话继续保留，不重复点击发码。已请主人在 https://portal.example.com:20034/ 的账号矩阵中
 点击“留一手”的“短信验证”并完成平台验证。验证通过后由原页面观察后续短信成功响应，
 再进入既有手机转发和验证码确认流程。没有自动完成平台挑战。
 

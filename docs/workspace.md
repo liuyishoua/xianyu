@@ -53,7 +53,7 @@ Flask 提供接口，Waitress 承载服务，SQLite 存储商品、消息缓存�
 
 ## 部署
 
-生产入口：<https://d.58nft.net:9448/>。后端仅监听 `127.0.0.1:8770`。
+生产入口：<https://portal.example.com:20034/>。后端仅监听 `127.0.0.1:20003`。
 `deploy/xianyu-web.service` 运行应用；`deploy/xianyu-proxy.service` 使用独立 Caddy 配置
 `deploy/xianyu.caddy` 提供 HTTPS。服务器配置安装在 `/etc/systemd/system/` 和 `/etc/caddy/xianyu.caddy`。
 
